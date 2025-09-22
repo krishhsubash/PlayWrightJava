@@ -1,0 +1,298 @@
+name: Playwright Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 3 * * 1' # Mondays 03:00 UTC cache refresh run
+
+jobs:
+  test:
+    name: Java Playwright (${{ matrix.browser }} / headed=${{ matrix.headed }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        headed: [false, true]
+      max-parallel: 6
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: .cache/ms-playwright
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+            distribution: temurin
+            java-version: '17'
+            cache: maven
+
+      - name: Show Java & Maven versions
+        run: |
+          java -version
+          mvn -version
+
+      - name: Cache Playwright Browsers
+        uses: actions/cache@v4
+        with:
+          path: .cache/ms-playwright
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            playwright-browsers-${{ runner.os }}-
+
+      - name: Ensure Playwright browsers installed (with system deps)
+        run: |
+          set -e
+          install_start=$(date +%s)
+          have_all=true
+          for d in chromium firefox webkit; do
+            if [ ! -d ".cache/ms-playwright/$d" ]; then have_all=false; break; fi
+          done
+          if $have_all; then
+            echo "All browsers already present in cache; skipping install-deps and installs."
+          else
+            echo "Missing at least one browser; running install-deps and targeted installs."
+            echo "Installing system dependencies via Playwright CLI (install-deps)"
+            sudo mvn -q exec:java -Dexec.classpathScope=test -Dexec.mainClass=com.microsoft.playwright.CLI -Dexec.args="install-deps" || echo "install-deps encountered issues (continuing)"
+            echo "Installing/validating Playwright browsers (chromium, firefox, webkit)"
+            for B in chromium firefox webkit; do
+              if [ -d ".cache/ms-playwright/$B" ]; then
+                echo "-- $B already cached"
+              else
+                echo "-- Installing $B"
+                mvn -q exec:java -Dexec.classpathScope=test -Dexec.mainClass=com.microsoft.playwright.CLI -Dexec.args="install $B" || export INSTALL_FAIL_$B=1
+              fi
+            done
+            if [ "${INSTALL_FAIL_webkit}" = "1" ]; then
+              echo "WebKit install failed; performing manual fallback package install and retry"
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                libwoff1 libopus0 libwebp6 libwebpdemux2 libwebpmux3 libenchant-2-2 libgudev-1.0-0 \
+                libsecret-1-0 libhyphen0 libgdk-pixbuf2.0-0 libegl1 libnotify4 libgles2 libxslt1.1 \
+                libevent-2.1-7 libvpx7 libgtk-3-0 libdbus-glib-1-2 libxcb-dri3-0 libdrm2 libxrandr2 \
+                libgbm1 libatspi2.0-0 libcups2 || true
+              mvn -q exec:java -Dexec.classpathScope=test -Dexec.mainClass=com.microsoft.playwright.CLI -Dexec.args="install webkit" || echo "WebKit install failed again"
+            fi
+          fi
+          echo "Installed browser directories:" || true
+          ls -1 .cache/ms-playwright || true
+          echo "Capturing Playwright and browser versions"
+          PLAYWRIGHT_JAR=$(find ~/.m2 -type f -name 'playwright-*.jar' | head -n1 || true)
+          if [ -n "$PLAYWRIGHT_JAR" ]; then echo "Playwright Java artifact: $(basename "$PLAYWRIGHT_JAR")"; fi
+          # Tiny Java to print version
+          echo 'import com.microsoft.playwright.*;public class PrintPWVersion{public static void main(String[]a){try(var p=Playwright.create()){System.out.println("Playwright Version="+Playwright.class.getPackage().getImplementationVersion());}}}' > PrintPWVersion.java
+          javac -cp $(echo ~/.m2/repository/com/microsoft/playwright/*/*.jar | tr ' ' ':') PrintPWVersion.java 2>/dev/null || true
+          java -cp .:$(echo ~/.m2/repository/com/microsoft/playwright/*/*.jar | tr ' ' ':') PrintPWVersion 2>/dev/null || true
+          echo "Browser executables (if present):" || true
+          find .cache/ms-playwright -maxdepth 2 -type f -name 'playwright.sh' -print || true
+          echo "Capturing playwright.sh --version (if node wrapper present)" || true
+          for script in $(find .cache/ms-playwright -type f -name 'playwright.sh' | head -n3); do
+            echo "-- $script --version"; bash "$script" --version || true; done
+          install_end=$(date +%s)
+          duration=$((install_end-install_start))
+          SUMMARY_FILE=$(mktemp)
+          {
+            echo '### Playwright Provisioning Summary';
+            date -u '+UTC Time: %Y-%m-%d %H:%M:%S';
+            if $have_all; then echo 'Cache State: All browsers were cached.'; else echo 'Cache State: One or more browsers installed this run.'; fi
+            echo 'Browsers directory listing:'; ls -1 .cache/ms-playwright || true
+            echo "Playwright Java artifact: $(basename "$PLAYWRIGHT_JAR" 2>/dev/null || echo unknown)";
+            echo "Install step duration (s): $duration";
+          } > "$SUMMARY_FILE"
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Run tests (${{ matrix.browser }} headed=${{ matrix.headed }})
+        run: |
+          CMD="mvn -B test -Dbrowser=${{ matrix.browser }} -Dtrace=true -DrecordVideo=${{ matrix.headed }} -Dheaded=${{ matrix.headed }}"
+          if [ "${{ matrix.headed }}" = "true" ]; then
+            echo "Running headed test with Xvfb"
+            xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' $CMD
+          else
+            $CMD
+          fi
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          python3 scripts/surefire_summary.py || echo "Summary generation failed"
+
+      - name: Archive test reports (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-${{ matrix.browser }}-headed-${{ matrix.headed }}
+          path: |
+            target/surefire-reports
+            playwright-report
+            target/allure-results
+            target/test-summary.md
+            target/flaky-history.json
+            target/retry-attempts.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
+
+  deploy-report:
+    name: Publish Allure Report
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble artifacts
+        run: |
+          mkdir -p combined/allure-results combined/test-summaries combined/history
+          find artifacts -type d -name allure-results -exec cp -r {}/* combined/allure-results \; || true
+          find artifacts -type f -name test-summary.md -exec cp {} combined/test-summaries/ \; || true
+          find artifacts -type f -name flaky-history.json -exec cp {} combined/history/ \; || true
+          find artifacts -type f -name retry-attempts.jsonl -exec cp {} combined/history/ \; || true
+          mkdir -p combined/artifacts/traces combined/artifacts/videos
+          find artifacts -type f -name '*.zip' -path '*traces*' -exec cp {} combined/artifacts/traces/ \; || true
+          find artifacts -type f -name '*.webm' -exec cp {} combined/artifacts/videos/ \; || true
+          mkdir -p combined/artifacts/logs
+          find artifacts -type f -path '*playwright-report/logs/*.log' -exec cp {} combined/artifacts/logs/ \; || true
+          python3 scripts/merge_flaky_histories.py
+          cp combined/flaky-history.json target/flaky-history.json 2>/dev/null || true
+      - name: Generate Allure Report
+        run: |
+          npm install -g allure-commandline --no-progress --no-audit --no-fund
+          allure generate combined/allure-results -o combined/allure-report --clean || echo "Allure generation failed"
+      - name: Validate Allure output
+        run: |
+          set -e
+          results_count=$(find combined/allure-results -maxdepth 1 -type f -name '*-result.json' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$results_count" = "0" ]; then
+            echo "No Allure result JSON files found (tests may have been skipped) - will allow placeholder."
+            exit 0
+          fi
+          if [ ! -f combined/allure-report/index.html ]; then
+            echo "Allure results ($results_count) present but index.html missing -> failing build." >&2
+            exit 1
+          fi
+          echo "Validated Allure report (index present, results_count=$results_count)."
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-cache-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            npm-cache-${{ runner.os }}-
+      - name: Generate Trends
+        run: |
+          python3 scripts/generate_trends.py || echo "Trend generation skipped"
+          mkdir -p combined/extra
+          cp target/trends.html combined/extra/trends.html || true
+          cp target/flaky-history.json combined/extra/flaky-history.json || true
+      - name: Build site
+        run: |
+          mkdir -p site/extra site/allure
+          cp -r combined/allure-report/* site/allure/ || true
+          if [ -f site/allure/index.html ]; then
+            if ! grep -q 'Dashboard</a>' site/allure/index.html; then
+              TMP=$(mktemp)
+              printf '%s\n' '<div style="font-family:system-ui,Arial,sans-serif;padding:6px 10px;background:#f5f5f5;border-bottom:1px solid #ddd;font-size:14px;"><a href="../" style="text-decoration:none;color:#0366d6;">Dashboard</a> / <span>Allure Report</span></div>' > "$TMP"
+              cat site/allure/index.html >> "$TMP" || true
+              mv "$TMP" site/allure/index.html || true
+            fi
+          fi
+          # Diagnostics and fallback if Allure generation failed
+          echo "Listing combined/allure-report (source):"; ls -1 combined/allure-report 2>/dev/null || echo "(missing)"
+          echo "Listing site/allure (published copy):"; ls -1 site/allure 2>/dev/null || echo "(missing)"
+          if [ ! -f site/allure/index.html ]; then
+            echo "Allure index not found; creating placeholder to avoid 404"
+            printf '%s' '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Allure Report Unavailable</title><style>body{font-family:system-ui,Arial,sans-serif;margin:40px;max-width:800px;}code{background:#f5f5f5;padding:2px 4px;border-radius:3px;} .note{color:#555;margin-top:1em;font-size:14px;}</style></head><body><h1>Allure Report Unavailable</h1><p>The expected Allure report files were not found in this deployment.</p><ul><li>Possible causes: empty <code>combined/allure-results</code>, generation failure, or all tests skipped.</li><li>Check the <strong>Generate Allure Report</strong> step logs in the workflow run.</li><li>Verify at least one <code>*-result.json</code> exists in <code>target/allure-results</code> during matrix jobs.</li></ul><p class="note">This placeholder prevents GitHub Pages 404. Once Allure generates successfully, this page will be replaced automatically.</p><p><a href="../">&larr; Back to Dashboard</a></p></body></html>' > site/allure/index.html
+          fi
+          echo "# Aggregated Test Summaries" > site/test-summary.md
+          for f in combined/test-summaries/*.md; do
+            echo "" >> site/test-summary.md
+            echo "## $(basename \"$f\")" >> site/test-summary.md
+            cat "$f" >> site/test-summary.md
+          done
+          cp combined/extra/* site/extra/ || true
+          echo '<meta http-equiv="refresh" content="0; url=./index.html" />' > site/404.html
+      - name: Create flaky badge JSON
+        run: |
+          if [ -f combined/flaky-history.json ]; then
+            count=$(python3 -c "import json;d=json.load(open('combined/flaky-history.json'));latest=(d[-1] if isinstance(d,list) and d else {});print(len(latest.get('flaky_candidates',[])))")
+          else
+            count=0
+          fi
+          if [ "$count" -eq 0 ]; then color=green; elif [ "$count" -le 3 ]; then color=yellow; else color=red; fi
+          mkdir -p site/badges
+          printf '{"schemaVersion":1,"label":"flaky","message":"%s","color":"%s"}\n' "$count" "$color" > site/badges/flaky-badge.json
+          echo "Flaky badge count: $count (color=$color)"
+      - name: Create failure rate badge JSON
+        run: |
+          if [ -f combined/flaky-history.json ]; then
+            stats=$(python3 -c "import json;d=json.load(open('combined/flaky-history.json'));latest=(d[-1] if isinstance(d,list) and d else {});s=latest.get('summary',{});print(s.get('total',0), s.get('failed',0))")
+            total=$(echo "$stats" | awk '{print $1}')
+            failed=$(echo "$stats" | awk '{print $2}')
+          else
+            total=0; failed=0
+          fi
+          if [ "$total" -gt 0 ]; then
+            rate=$(python3 -c "t=$total;f=$failed;print(f'{(f/t)*100:.1f}')")
+          else
+            rate=0.0
+          fi
+          rint=${rate%.*}
+          if [ "$rint" -le 2 ]; then color=green; elif [ "$rint" -le 10 ]; then color=yellow; else color=red; fi
+          mkdir -p site/badges
+            printf '{"schemaVersion":1,"label":"fail rate","message":"%s%%","color":"%s"}\n' "$rate" "$color" > site/badges/failure-badge.json
+          echo "Failure rate: $rate% (color=$color) failed=$failed total=$total"
+      - name: Create stability badge JSON
+        run: |
+          if [ -f site/badges/failure-badge.json ]; then
+            fail_rate=$(jq -r '.message' site/badges/failure-badge.json | tr -d '%')
+          else
+            fail_rate=0
+          fi
+          # Stability score = 100 - fail_rate (clamped 0..100)
+          score=$(python3 -c "r=float('$fail_rate');s=max(0.0, min(100.0, 100.0-r));print(f'{s:.1f}')")
+          sint=${score%.*}
+          if [ "$sint" -ge 98 ]; then color=green; elif [ "$sint" -ge 90 ]; then color=yellow; else color=red; fi
+          mkdir -p site/badges
+          printf '{"schemaVersion":1,"label":"stability","message":"%s","color":"%s"}\n' "$score" "$color" > site/badges/stability-badge.json
+          echo "Stability score: $score (color=$color)"
+      - name: Create retry success badge JSON
+        run: |
+          rate=0.0
+          if [ -f combined/flaky-history.json ]; then
+            rate=$(python3 -c "import json;d=json.load(open('combined/flaky-history.json'));l=(d[-1] if isinstance(d,list) and d else {});rs=l.get('retry_stats',{});print(rs.get('recovery_rate',0.0))")
+          fi
+          rint=${rate%.*}
+          if [ "$rint" -ge 80 ]; then color=green; elif [ "$rint" -ge 50 ]; then color=yellow; else color=red; fi
+          mkdir -p site/badges
+            printf '{"schemaVersion":1,"label":"retry recovery","message":"%s%%","color":"%s"}\n' "$rate" "$color" > site/badges/retry-badge.json
+          echo "Retry recovery rate: $rate% (color=$color)"
+      - name: Generate dashboard
+        env:
+          SITE_BASE: https://krishhsubash.github.io/PlayWrightJava/
+        run: |
+          python3 scripts/generate_dashboard.py
+          echo "Dashboard at site/index.html; Allure at site/allure/index.html"
+      - name: Slack notify (flaky increase)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          if [ ! -f combined/flaky-history.json ]; then echo "No history"; exit 0; fi
+          python3 scripts/slack_notify.py || echo "Slack notify script failed"
+      - name: Upload Pages artifact
+        if: ${{ hashFiles('site/index.html') != '' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Deploy to GitHub Pages
+        if: ${{ hashFiles('site/index.html') != '' }}
+        uses: actions/deploy-pages@v4
